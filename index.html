@@ -1,0 +1,1956 @@
+#!/usr/bin/env python3
+"""
+Telegram Web Client на Pyrogram и Flask
+Все в одном файле: telegram_client.py
+"""
+
+import os
+import asyncio
+import json
+import sqlite3
+import hashlib
+import time
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any
+from pathlib import Path
+
+from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for, send_file
+from pyrogram import Client, filters, types, enums
+from pyrogram.errors import FloodWait, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
+from pyrogram.storage import SQLiteStorage
+
+# Инициализация Flask
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)
+
+# Конфигурация
+BASE_DIR = Path(__file__).parent
+SESSION_DB = BASE_DIR / 'sessions.db'
+MEDIA_CACHE = BASE_DIR / 'media_cache'
+MEDIA_CACHE.mkdir(exist_ok=True)
+
+# Инициализация БД для сессий
+def init_db():
+    conn = sqlite3.connect(SESSION_DB)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS user_sessions
+                 (user_id INTEGER PRIMARY KEY,
+                  session_string TEXT,
+                  phone_number TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS api_credentials
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  api_id INTEGER,
+                  api_hash TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# Глобальные переменные для клиента
+clients = {}
+user_states = {}
+
+# HTML ШАБЛОНЫ ===============================================================
+
+BASE_HTML = '''
+<!DOCTYPE html>
+<html lang="ru" data-theme="{{ theme|default('light') }}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telegram Web</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        :root {
+            --primary-color: #40A7E3;
+            --primary-dark: #2D96D1;
+            --bg-primary: #ffffff;
+            --bg-secondary: #f0f2f5;
+            --bg-tertiary: #e4e6eb;
+            --text-primary: #050505;
+            --text-secondary: #65676b;
+            --border-color: #e4e6eb;
+            --message-in: #ffffff;
+            --message-out: #d9fdd3;
+            --unread-badge: #40A7E3;
+            --online-indicator: #31A24C;
+        }
+
+        [data-theme="dark"] {
+            --primary-color: #40A7E3;
+            --primary-dark: #2D96D1;
+            --bg-primary: #1a1a1a;
+            --bg-secondary: #242526;
+            --bg-tertiary: #3a3b3c;
+            --text-primary: #e4e6eb;
+            --text-secondary: #b0b3b8;
+            --border-color: #3e4042;
+            --message-in: #242526;
+            --message-out: #005c4b;
+            --unread-badge: #40A7E3;
+            --online-indicator: #31A24C;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background-color: var(--bg-secondary);
+            color: var(--text-primary);
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        .app-container {
+            display: flex;
+            height: 100vh;
+            max-width: 1400px;
+            margin: 0 auto;
+            background-color: var(--bg-primary);
+            box-shadow: 0 0 20px rgba(0,0,0,0.1);
+        }
+
+        /* Стили для боковой панели */
+        .sidebar {
+            width: 350px;
+            border-right: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            background-color: var(--bg-primary);
+        }
+
+        .sidebar-header {
+            padding: 20px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .user-info {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .user-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background-color: var(--primary-color);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 18px;
+        }
+
+        .user-name {
+            font-weight: 600;
+        }
+
+        .logout-btn {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            padding: 8px;
+            border-radius: 8px;
+            transition: background-color 0.2s;
+        }
+
+        .logout-btn:hover {
+            background-color: var(--bg-tertiary);
+        }
+
+        .search-container {
+            padding: 15px 20px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .search-box {
+            width: 100%;
+            padding: 10px 15px;
+            border-radius: 20px;
+            border: 1px solid var(--border-color);
+            background-color: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 14px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        .search-box:focus {
+            border-color: var(--primary-color);
+        }
+
+        .chats-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px 0;
+        }
+
+        .chat-item {
+            display: flex;
+            padding: 12px 20px;
+            gap: 15px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .chat-item:hover {
+            background-color: var(--bg-secondary);
+        }
+
+        .chat-item.active {
+            background-color: var(--bg-tertiary);
+        }
+
+        .chat-avatar {
+            position: relative;
+            flex-shrink: 0;
+        }
+
+        .avatar-img {
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            object-fit: cover;
+        }
+
+        .avatar-placeholder {
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            background-color: var(--primary-color);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 20px;
+        }
+
+        .online-status {
+            position: absolute;
+            bottom: 2px;
+            right: 2px;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background-color: var(--online-indicator);
+            border: 2px solid var(--bg-primary);
+        }
+
+        .chat-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .chat-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 4px;
+        }
+
+        .chat-title {
+            font-weight: 600;
+            font-size: 15px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .chat-time {
+            font-size: 12px;
+            color: var(--text-secondary);
+            white-space: nowrap;
+        }
+
+        .chat-preview {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .preview-text {
+            font-size: 14px;
+            color: var(--text-secondary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            flex: 1;
+        }
+
+        .unread-badge {
+            background-color: var(--unread-badge);
+            color: white;
+            font-size: 12px;
+            padding: 2px 8px;
+            border-radius: 12px;
+            min-width: 20px;
+            text-align: center;
+            font-weight: 600;
+            margin-left: 8px;
+        }
+
+        /* Стили для основной области чата */
+        .chat-area {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background-color: var(--bg-primary);
+        }
+
+        .chat-header {
+            padding: 20px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .chat-user-info {
+            flex: 1;
+        }
+
+        .chat-user-name {
+            font-weight: 600;
+            font-size: 18px;
+        }
+
+        .chat-user-status {
+            font-size: 14px;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+
+        .chat-actions {
+            display: flex;
+            gap: 10px;
+        }
+
+        .action-btn {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            padding: 8px;
+            border-radius: 8px;
+            transition: background-color 0.2s;
+        }
+
+        .action-btn:hover {
+            background-color: var(--bg-tertiary);
+        }
+
+        .messages-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+            background-color: var(--bg-secondary);
+            background-image: url("data:image/svg+xml,%3Csvg width='100' height='100' viewBox='0 0 100 100' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M11 18c3.866 0 7-3.134 7-7s-3.134-7-7-7-7 3.134-7 7 3.134 7 7 7zm48 25c3.866 0 7-3.134 7-7s-3.134-7-7-7-7 3.134-7 7 3.134 7 7 7zm-43-7c1.657 0 3-1.343 3-3s-1.343-3-3-3-3 1.343-3 3 1.343 3 3 3zm63 31c1.657 0 3-1.343 3-3s-1.343-3-3-3-3 1.343-3 3 1.343 3 3 3zM34 90c1.657 0 3-1.343 3-3s-1.343-3-3-3-3 1.343-3 3 1.343 3 3 3zm56-76c1.657 0 3-1.343 3-3s-1.343-3-3-3-3 1.343-3 3 1.343 3 3 3zM12 86c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm28-65c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm23-11c2.76 0 5-2.24 5-5s-2.24-5-5-5-5 2.24-5 5 2.24 5 5 5zm-6 60c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm29 22c2.76 0 5-2.24 5-5s-2.24-5-5-5-5 2.24-5 5 2.24 5 5 5zM32 63c2.76 0 5-2.24 5-5s-2.24-5-5-5-5 2.24-5 5 2.24 5 5 5zm57-13c2.76 0 5-2.24 5-5s-2.24-5-5-5-5 2.24-5 5 2.24 5 5 5zm-9-21c1.105 0 2-.895 2-2s-.895-2-2-2-2 .895-2 2 .895 2 2 2zM60 91c1.105 0 2-.895 2-2s-.895-2-2-2-2 .895-2 2 .895 2 2 2zM35 41c1.105 0 2-.895 2-2s-.895-2-2-2-2 .895-2 2 .895 2 2 2zM12 60c1.105 0 2-.895 2-2s-.895-2-2-2-2 .895-2 2 .895 2 2 2z' fill='%233a3b3c' fill-opacity='0.05' fill-rule='evenodd'/%3E%3C/svg%3E");
+        }
+
+        .message-date {
+            text-align: center;
+            margin: 20px 0;
+            position: relative;
+        }
+
+        .date-label {
+            display: inline-block;
+            padding: 5px 15px;
+            background-color: var(--bg-tertiary);
+            border-radius: 15px;
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+
+        .message-wrapper {
+            margin-bottom: 10px;
+            display: flex;
+        }
+
+        .message-wrapper.outgoing {
+            justify-content: flex-end;
+        }
+
+        .message {
+            max-width: 65%;
+            padding: 8px 12px;
+            border-radius: 18px;
+            position: relative;
+            word-wrap: break-word;
+        }
+
+        .message.incoming {
+            background-color: var(--message-in);
+            border-bottom-left-radius: 4px;
+        }
+
+        .message.outgoing {
+            background-color: var(--message-out);
+            border-bottom-right-radius: 4px;
+        }
+
+        .message-text {
+            font-size: 15px;
+            line-height: 1.4;
+        }
+
+        .message-time {
+            font-size: 11px;
+            color: var(--text-secondary);
+            text-align: right;
+            margin-top: 2px;
+            margin-left: 10px;
+            float: right;
+        }
+
+        .message-status {
+            display: inline-block;
+            margin-left: 4px;
+        }
+
+        .media-preview {
+            margin-top: 8px;
+            border-radius: 12px;
+            overflow: hidden;
+            max-width: 300px;
+        }
+
+        .media-preview img {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+
+        .typing-indicator {
+            display: flex;
+            padding: 10px 20px;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .typing-dots {
+            display: flex;
+            gap: 4px;
+        }
+
+        .typing-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--text-secondary);
+            animation: typing 1.4s infinite;
+        }
+
+        .typing-dot:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+
+        .typing-dot:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+
+        @keyframes typing {
+            0%, 60%, 100% {
+                transform: translateY(0);
+            }
+            30% {
+                transform: translateY(-5px);
+            }
+        }
+
+        /* Стили для панели ввода */
+        .input-container {
+            padding: 20px;
+            border-top: 1px solid var(--border-color);
+            background-color: var(--bg-primary);
+        }
+
+        .input-area {
+            display: flex;
+            align-items: flex-end;
+            gap: 15px;
+        }
+
+        .input-attachments {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .attachment-btn {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            padding: 8px;
+            border-radius: 8px;
+            transition: background-color 0.2s;
+        }
+
+        .attachment-btn:hover {
+            background-color: var(--bg-tertiary);
+        }
+
+        .message-input {
+            flex: 1;
+            padding: 12px 20px;
+            border-radius: 25px;
+            border: 1px solid var(--border-color);
+            background-color: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 15px;
+            outline: none;
+            resize: none;
+            max-height: 150px;
+            min-height: 50px;
+            line-height: 1.4;
+        }
+
+        .message-input:focus {
+            border-color: var(--primary-color);
+        }
+
+        .send-btn {
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .send-btn:hover {
+            background-color: var(--primary-dark);
+        }
+
+        .send-btn:disabled {
+            background-color: var(--bg-tertiary);
+            cursor: not-allowed;
+        }
+
+        /* Стили для страниц авторизации */
+        .auth-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            background-color: var(--bg-secondary);
+            padding: 20px;
+        }
+
+        .auth-box {
+            background-color: var(--bg-primary);
+            border-radius: 16px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+            padding: 40px;
+            width: 100%;
+            max-width: 400px;
+        }
+
+        .auth-header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .auth-logo {
+            color: var(--primary-color);
+            font-size: 40px;
+            margin-bottom: 15px;
+        }
+
+        .auth-title {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+
+        .auth-subtitle {
+            color: var(--text-secondary);
+            font-size: 15px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+
+        .form-input {
+            width: 100%;
+            padding: 12px 16px;
+            border-radius: 12px;
+            border: 1px solid var(--border-color);
+            background-color: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 15px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        .form-input:focus {
+            border-color: var(--primary-color);
+        }
+
+        .auth-btn {
+            width: 100%;
+            padding: 14px;
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        .auth-btn:hover {
+            background-color: var(--primary-dark);
+        }
+
+        .auth-btn:disabled {
+            background-color: var(--bg-tertiary);
+            cursor: not-allowed;
+        }
+
+        .auth-footer {
+            text-align: center;
+            margin-top: 20px;
+            color: var(--text-secondary);
+            font-size: 14px;
+        }
+
+        .auth-link {
+            color: var(--primary-color);
+            text-decoration: none;
+        }
+
+        .auth-link:hover {
+            text-decoration: underline;
+        }
+
+        .error-message {
+            background-color: #fee;
+            color: #c33;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+
+        .theme-switcher {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 1000;
+        }
+
+        .theme-btn {
+            background-color: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 10px 15px;
+            border-radius: 20px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+
+        .theme-btn:hover {
+            background-color: var(--bg-tertiary);
+        }
+
+        /* Анимации */
+        .fade-in {
+            animation: fadeIn 0.3s ease-in-out;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .slide-in {
+            animation: slideIn 0.3s ease-in-out;
+        }
+
+        @keyframes slideIn {
+            from { transform: translateX(-20px); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+
+        /* Адаптивность */
+        @media (max-width: 768px) {
+            .app-container {
+                flex-direction: column;
+            }
+            
+            .sidebar {
+                width: 100%;
+                height: 70vh;
+            }
+            
+            .chat-area {
+                height: 30vh;
+            }
+            
+            .message {
+                max-width: 85%;
+            }
+        }
+    </style>
+</head>
+<body>
+    {% if not session.get('user_id') %}
+    <div class="theme-switcher">
+        <button class="theme-btn" onclick="toggleTheme()">
+            <i class="fas fa-moon"></i>
+            <span>Тема</span>
+        </button>
+    </div>
+    {% endif %}
+    
+    {% block content %}{% endblock %}
+    
+    <script>
+        // Управление темой
+        function toggleTheme() {
+            const currentTheme = document.documentElement.getAttribute('data-theme');
+            const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+            document.documentElement.setAttribute('data-theme', newTheme);
+            localStorage.setItem('theme', newTheme);
+        }
+        
+        // Восстановление темы из localStorage
+        const savedTheme = localStorage.getItem('theme') || 'light';
+        document.documentElement.setAttribute('data-theme', savedTheme);
+        
+        // Автофокус на поле ввода
+        document.addEventListener('DOMContentLoaded', function() {
+            const input = document.querySelector('.form-input, .message-input');
+            if (input) input.focus();
+        });
+    </script>
+</body>
+</html>
+'''
+
+LOGIN_HTML = '''
+{% extends "base.html" %}
+{% block content %}
+<div class="auth-container fade-in">
+    <div class="auth-box">
+        <div class="auth-header">
+            <div class="auth-logo">
+                <i class="fab fa-telegram"></i>
+            </div>
+            <h1 class="auth-title">Telegram Web</h1>
+            <p class="auth-subtitle">Войдите в свой аккаунт Telegram</p>
+        </div>
+        
+        {% if error %}
+        <div class="error-message">
+            {{ error }}
+        </div>
+        {% endif %}
+        
+        <form method="POST" action="{{ url_for('api_login') }}">
+            <div class="form-group">
+                <label class="form-label" for="api_id">API ID</label>
+                <input type="number" class="form-input" id="api_id" name="api_id" 
+                       placeholder="Введите ваш API ID" required>
+            </div>
+            
+            <div class="form-group">
+                <label class="form-label" for="api_hash">API Hash</label>
+                <input type="text" class="form-input" id="api_hash" name="api_hash" 
+                       placeholder="Введите ваш API Hash" required>
+            </div>
+            
+            <button type="submit" class="auth-btn">
+                Продолжить
+            </button>
+        </form>
+        
+        <div class="auth-footer">
+            <p>Получить API ID и Hash можно на <a href="https://my.telegram.org" 
+               class="auth-link" target="_blank">my.telegram.org</a></p>
+        </div>
+    </div>
+</div>
+{% endblock %}
+'''
+
+PHONE_HTML = '''
+{% extends "base.html" %}
+{% block content %}
+<div class="auth-container fade-in">
+    <div class="auth-box">
+        <div class="auth-header">
+            <div class="auth-logo">
+                <i class="fab fa-telegram"></i>
+            </div>
+            <h1 class="auth-title">Введите номер телефона</h1>
+            <p class="auth-subtitle">Введите номер телефона, привязанный к аккаунту Telegram</p>
+        </div>
+        
+        {% if error %}
+        <div class="error-message">
+            {{ error }}
+        </div>
+        {% endif %}
+        
+        <form method="POST" action="{{ url_for('send_code') }}">
+            <div class="form-group">
+                <label class="form-label" for="phone">Номер телефона</label>
+                <input type="tel" class="form-input" id="phone" name="phone" 
+                       placeholder="+79991234567" pattern="\+[0-9]{11,15}" required>
+                <small style="color: var(--text-secondary); margin-top: 5px; display: block;">
+                    Формат: +79991234567
+                </small>
+            </div>
+            
+            <button type="submit" class="auth-btn">
+                Получить код
+            </button>
+        </form>
+        
+        <div class="auth-footer">
+            <a href="{{ url_for('logout') }}" class="auth-link">Назад</a>
+        </div>
+    </div>
+</div>
+{% endblock %}
+'''
+
+CODE_HTML = '''
+{% extends "base.html" %}
+{% block content %}
+<div class="auth-container fade-in">
+    <div class="auth-box">
+        <div class="auth-header">
+            <div class="auth-logo">
+                <i class="fab fa-telegram"></i>
+            </div>
+            <h1 class="auth-title">Введите код из Telegram</h1>
+            <p class="auth-subtitle">Мы отправили SMS с кодом на номер {{ phone }}</p>
+        </div>
+        
+        {% if error %}
+        <div class="error-message">
+            {{ error }}
+        </div>
+        {% endif %}
+        
+        <form method="POST" action="{{ url_for('verify_code') }}">
+            <div class="form-group">
+                <label class="form-label" for="code">5-значный код</label>
+                <input type="text" class="form-input" id="code" name="code" 
+                       placeholder="12345" pattern="[0-9]{5}" maxlength="5" required
+                       style="text-align: center; font-size: 24px; letter-spacing: 5px;">
+            </div>
+            
+            <button type="submit" class="auth-btn">
+                Войти
+            </button>
+        </form>
+        
+        <div class="auth-footer">
+            <a href="{{ url_for('phone') }}" class="auth-link">Изменить номер</a>
+            <span style="margin: 0 10px;">•</span>
+            <a href="#" class="auth-link" onclick="resendCode()">Отправить код повторно</a>
+        </div>
+    </div>
+</div>
+
+<script>
+function resendCode() {
+    fetch('{{ url_for("resend_code") }}', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({phone: '{{ phone }}'})
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            alert('Код отправлен повторно!');
+        } else {
+            alert('Ошибка: ' + data.error);
+        }
+    });
+}
+</script>
+{% endblock %}
+'''
+
+PASSWORD_HTML = '''
+{% extends "base.html" %}
+{% block content %}
+<div class="auth-container fade-in">
+    <div class="auth-box">
+        <div class="auth-header">
+            <div class="auth-logo">
+                <i class="fab fa-telegram"></i>
+            </div>
+            <h1 class="auth-title">Двухфакторная аутентификация</h1>
+            <p class="auth-subtitle">Введите пароль для входа в аккаунт</p>
+        </div>
+        
+        {% if error %}
+        <div class="error-message">
+            {{ error }}
+        </div>
+        {% endif %}
+        
+        <form method="POST" action="{{ url_for('check_password') }}">
+            <div class="form-group">
+                <label class="form-label" for="password">Пароль</label>
+                <input type="password" class="form-input" id="password" name="password" 
+                       placeholder="Введите пароль" required>
+            </div>
+            
+            <button type="submit" class="auth-btn">
+                Продолжить
+            </button>
+        </form>
+        
+        <div class="auth-footer">
+            <a href="{{ url_for('logout') }}" class="auth-link">Вернуться к началу</a>
+        </div>
+    </div>
+</div>
+{% endblock %}
+'''
+
+MAIN_HTML = '''
+{% extends "base.html" %}
+{% block content %}
+<div class="app-container">
+    <!-- Боковая панель -->
+    <div class="sidebar">
+        <div class="sidebar-header">
+            <div class="user-info">
+                <div class="user-avatar">
+                    {{ user.first_name[0] if user.first_name else 'U' }}
+                </div>
+                <div>
+                    <div class="user-name">
+                        {{ user.first_name }} {{ user.last_name or '' }}
+                    </div>
+                    <div style="font-size: 12px; color: var(--text-secondary);">
+                        {{ user.username or 'Без имени пользователя' }}
+                    </div>
+                </div>
+            </div>
+            <button class="logout-btn" onclick="logout()" title="Выйти">
+                <i class="fas fa-sign-out-alt"></i>
+            </button>
+        </div>
+        
+        <div class="search-container">
+            <input type="text" class="search-box" placeholder="Поиск..." 
+                   oninput="searchChats(this.value)">
+        </div>
+        
+        <div class="chats-list" id="chatsList">
+            <div class="loading-chats">
+                <div style="text-align: center; padding: 20px; color: var(--text-secondary);">
+                    <i class="fas fa-spinner fa-spin"></i> Загрузка чатов...
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Основная область чата -->
+    <div class="chat-area" id="chatArea">
+        <div class="welcome-screen" style="display: flex; align-items: center; justify-content: center; height: 100%;">
+            <div style="text-align: center; color: var(--text-secondary);">
+                <div style="font-size: 48px; margin-bottom: 20px; color: var(--primary-color);">
+                    <i class="fab fa-telegram"></i>
+                </div>
+                <h2 style="margin-bottom: 10px;">Добро пожаловать в Telegram Web</h2>
+                <p>Выберите чат для начала общения</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+let currentChatId = null;
+let isLoadingMessages = false;
+let allChatsLoaded = false;
+let offset = 0;
+const limit = 20;
+
+// Загрузка чатов
+async function loadChats() {
+    try {
+        const response = await fetch(`/api/chats?offset=${offset}&limit=${limit}`);
+        const data = await response.json();
+        
+        if (data.success) {
+            const chatsList = document.getElementById('chatsList');
+            
+            if (offset === 0) {
+                chatsList.innerHTML = '';
+            }
+            
+            if (data.chats.length === 0) {
+                allChatsLoaded = true;
+                if (offset === 0) {
+                    chatsList.innerHTML = '<div style="text-align: center; padding: 20px; color: var(--text-secondary);">Нет чатов</div>';
+                }
+                return;
+            }
+            
+            data.chats.forEach(chat => {
+                const chatElement = createChatElement(chat);
+                chatsList.appendChild(chatElement);
+            });
+            
+            offset += limit;
+        }
+    } catch (error) {
+        console.error('Ошибка загрузки чатов:', error);
+    }
+}
+
+// Создание элемента чата
+function createChatElement(chat) {
+    const div = document.createElement('div');
+    div.className = 'chat-item';
+    div.dataset.chatId = chat.id;
+    div.onclick = () => selectChat(chat.id, chat.title);
+    
+    let avatarContent = '';
+    if (chat.photo) {
+        avatarContent = `<img src="/api/media/${chat.photo}" alt="${chat.title}" class="avatar-img">`;
+    } else {
+        const initials = chat.title.substring(0, 1).toUpperCase();
+        avatarContent = `<div class="avatar-placeholder" style="background-color: ${getColorForString(chat.title)}">
+                          ${initials}
+                        </div>`;
+    }
+    
+    const time = chat.last_message_date ? formatTime(chat.last_message_date) : '';
+    const preview = chat.last_message ? chat.last_message.substring(0, 30) + (chat.last_message.length > 30 ? '...' : '') : '';
+    
+    div.innerHTML = `
+        <div class="chat-avatar">
+            ${avatarContent}
+            ${chat.is_online ? '<div class="online-status"></div>' : ''}
+        </div>
+        <div class="chat-info">
+            <div class="chat-header">
+                <div class="chat-title">${escapeHtml(chat.title)}</div>
+                <div class="chat-time">${time}</div>
+            </div>
+            <div class="chat-preview">
+                <div class="preview-text">${escapeHtml(preview)}</div>
+                ${chat.unread_count > 0 ? `<span class="unread-badge">${chat.unread_count}</span>` : ''}
+            </div>
+        </div>
+    `;
+    
+    return div;
+}
+
+// Выбор чата
+async function selectChat(chatId, chatTitle) {
+    if (currentChatId === chatId) return;
+    
+    currentChatId = chatId;
+    
+    // Обновить активный элемент в списке
+    document.querySelectorAll('.chat-item').forEach(item => {
+        item.classList.remove('active');
+        if (item.dataset.chatId == chatId) {
+            item.classList.add('active');
+        }
+    });
+    
+    // Загрузить сообщения
+    await loadMessages(chatId, chatTitle);
+}
+
+// Загрузка сообщений
+async function loadMessages(chatId, chatTitle) {
+    try {
+        const response = await fetch(`/api/messages/${chatId}`);
+        const data = await response.json();
+        
+        if (data.success) {
+            const chatArea = document.getElementById('chatArea');
+            chatArea.innerHTML = createChatInterface(chatTitle, data.messages);
+            
+            // Прокрутить вниз
+            const messagesContainer = chatArea.querySelector('.messages-container');
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            
+            // Настроить отправку сообщений
+            setupMessageSending(chatId);
+        }
+    } catch (error) {
+        console.error('Ошибка загрузки сообщений:', error);
+    }
+}
+
+// Создание интерфейса чата
+function createChatInterface(chatTitle, messages) {
+    let messagesHtml = '';
+    let lastDate = null;
+    
+    messages.forEach(msg => {
+        const msgDate = new Date(msg.date * 1000).toLocaleDateString();
+        
+        if (msgDate !== lastDate) {
+            messagesHtml += `
+                <div class="message-date">
+                    <span class="date-label">${msgDate}</span>
+                </div>
+            `;
+            lastDate = msgDate;
+        }
+        
+        const time = new Date(msg.date * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+        
+        messagesHtml += `
+            <div class="message-wrapper ${msg.outgoing ? 'outgoing' : 'incoming'}">
+                <div class="message ${msg.outgoing ? 'outgoing' : 'incoming'}">
+                    ${msg.text ? `<div class="message-text">${escapeHtml(msg.text)}</div>` : ''}
+                    ${msg.media ? `<div class="media-preview"><img src="/api/media/${msg.media}" alt="Медиа"></div>` : ''}
+                    <div class="message-time">
+                        ${time}
+                        ${msg.outgoing ? `<span class="message-status">${getStatusIcon(msg.status)}</span>` : ''}
+                    </div>
+                </div>
+            </div>
+        `;
+    });
+    
+    return `
+        <div class="chat-header">
+            <div class="chat-avatar">
+                <div class="avatar-placeholder">
+                    ${chatTitle.substring(0, 1).toUpperCase()}
+                </div>
+            </div>
+            <div class="chat-user-info">
+                <div class="chat-user-name">${escapeHtml(chatTitle)}</div>
+                <div class="chat-user-status">в сети</div>
+            </div>
+            <div class="chat-actions">
+                <button class="action-btn" title="Поиск">
+                    <i class="fas fa-search"></i>
+                </button>
+                <button class="action-btn" title="Меню">
+                    <i class="fas fa-ellipsis-v"></i>
+                </button>
+            </div>
+        </div>
+        
+        <div class="messages-container" id="messagesContainer">
+            ${messagesHtml}
+            <div id="typingIndicator" style="display: none;">
+                <div class="typing-indicator">
+                    <div class="typing-dots">
+                        <div class="typing-dot"></div>
+                        <div class="typing-dot"></div>
+                        <div class="typing-dot"></div>
+                    </div>
+                    Печатает...
+                </div>
+            </div>
+        </div>
+        
+        <div class="input-container">
+            <div class="input-attachments">
+                <button class="attachment-btn" title="Прикрепить фото" onclick="attachMedia('photo')">
+                    <i class="fas fa-image"></i>
+                </button>
+                <button class="attachment-btn" title="Прикрепить файл" onclick="attachMedia('document')">
+                    <i class="fas fa-paperclip"></i>
+                </button>
+                <button class="attachment-btn" title="Эмодзи">
+                    <i class="far fa-smile"></i>
+                </button>
+            </div>
+            <div class="input-area">
+                <textarea class="message-input" id="messageInput" 
+                          placeholder="Введите сообщение..." 
+                          onkeydown="handleKeyDown(event)"
+                          rows="1"></textarea>
+                <button class="send-btn" id="sendBtn" onclick="sendMessage()">
+                    <i class="fas fa-paper-plane"></i>
+                </button>
+            </div>
+        </div>
+        
+        <input type="file" id="fileInput" style="display: none;" onchange="handleFileSelect(event)">
+    `;
+}
+
+// Настройка отправки сообщений
+function setupMessageSending(chatId) {
+    window.sendMessage = async function() {
+        const input = document.getElementById('messageInput');
+        const text = input.value.trim();
+        
+        if (!text) return;
+        
+        try {
+            const response = await fetch('/api/send_message', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    chat_id: chatId,
+                    text: text
+                })
+            });
+            
+            const data = await response.json();
+            
+            if (data.success) {
+                input.value = '';
+                // Добавить сообщение в список
+                addMessageToChat(data.message);
+            }
+        } catch (error) {
+            console.error('Ошибка отправки сообщения:', error);
+            alert('Ошибка отправки сообщения');
+        }
+    };
+}
+
+// Добавить сообщение в чат
+function addMessageToChat(message) {
+    const messagesContainer = document.getElementById('messagesContainer');
+    const time = new Date(message.date * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+    
+    const messageHtml = `
+        <div class="message-wrapper outgoing">
+            <div class="message outgoing">
+                <div class="message-text">${escapeHtml(message.text)}</div>
+                <div class="message-time">
+                    ${time}
+                    <span class="message-status">${getStatusIcon('pending')}</span>
+                </div>
+            </div>
+        </div>
+    `;
+    
+    messagesContainer.insertAdjacentHTML('beforeend', messageHtml);
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+}
+
+// Обработка нажатия клавиш
+function handleKeyDown(event) {
+    const input = event.target;
+    
+    // Авто-высота textarea
+    input.style.height = 'auto';
+    input.style.height = (input.scrollHeight) + 'px';
+    
+    // Отправка по Ctrl+Enter или Cmd+Enter
+    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+        event.preventDefault();
+        sendMessage();
+    }
+    
+    // Отправка по Enter (без Shift)
+    if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        sendMessage();
+    }
+}
+
+// Прикрепление медиа
+function attachMedia(type) {
+    const input = document.getElementById('fileInput');
+    input.accept = type === 'photo' ? 'image/*' : '*/*';
+    input.click();
+}
+
+// Обработка выбора файла
+function handleFileSelect(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    
+    // Здесь будет реализация загрузки файла
+    alert(`Файл "${file.name}" выбран. Загрузка будет реализована позже.`);
+}
+
+// Поиск чатов
+function searchChats(query) {
+    // Реализация поиска
+    console.log('Поиск:', query);
+}
+
+// Выход
+function logout() {
+    if (confirm('Вы уверены, что хотите выйти?')) {
+        window.location.href = '/logout';
+    }
+}
+
+// Вспомогательные функции
+function getColorForString(str) {
+    const colors = ['#40A7E3', '#FF6B6B', '#4ECDC4', '#FFD166', '#06D6A0', '#118AB2', '#EF476F'];
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+        hash = str.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    return colors[Math.abs(hash) % colors.length];
+}
+
+function formatTime(timestamp) {
+    const date = new Date(timestamp * 1000);
+    const now = new Date();
+    const diff = now - date;
+    
+    if (diff < 86400000) { // Менее суток
+        return date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+    } else if (diff < 604800000) { // Менее недели
+        return date.toLocaleDateString([], {weekday: 'short'});
+    } else {
+        return date.toLocaleDateString([], {month: 'short', day: 'numeric'});
+    }
+}
+
+function getStatusIcon(status) {
+    switch(status) {
+        case 'sent': return '✓';
+        case 'delivered': return '✓✓';
+        case 'read': return '✓✓';
+        default: return '🕓';
+    }
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Загрузка чатов при загрузке страницы
+document.addEventListener('DOMContentLoaded', () => {
+    loadChats();
+    
+    // Бесконечный скролл
+    const chatsList = document.getElementById('chatsList');
+    chatsList.addEventListener('scroll', () => {
+        if (chatsList.scrollTop + chatsList.clientHeight >= chatsList.scrollHeight - 100 && !allChatsLoaded) {
+            loadChats();
+        }
+    });
+    
+    // Polling для новых сообщений
+    setInterval(() => {
+        if (currentChatId) {
+            checkNewMessages(currentChatId);
+        }
+    }, 3000);
+});
+
+// Проверка новых сообщений
+async function checkNewMessages(chatId) {
+    try {
+        const response = await fetch(`/api/check_messages/${chatId}`);
+        const data = await response.json();
+        
+        if (data.success && data.has_new) {
+            // Обновить список сообщений
+            const messagesContainer = document.getElementById('messagesContainer');
+            if (messagesContainer) {
+                // Добавить новые сообщения
+                data.new_messages.forEach(msg => {
+                    const time = new Date(msg.date * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+                    
+                    const messageHtml = `
+                        <div class="message-wrapper ${msg.outgoing ? 'outgoing' : 'incoming'}">
+                            <div class="message ${msg.outgoing ? 'outgoing' : 'incoming'}">
+                                <div class="message-text">${escapeHtml(msg.text)}</div>
+                                <div class="message-time">
+                                    ${time}
+                                    ${msg.outgoing ? `<span class="message-status">${getStatusIcon(msg.status)}</span>` : ''}
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                    
+                    messagesContainer.insertAdjacentHTML('beforeend', messageHtml);
+                });
+                
+                // Прокрутить к последнему сообщению
+                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            }
+        }
+    } catch (error) {
+        console.error('Ошибка проверки сообщений:', error);
+    }
+}
+</script>
+{% endblock %}
+'''
+
+# ФУНКЦИИ ДЛЯ РАБОТЫ С PYROGRAM ==============================================
+
+def get_client(user_id: int) -> Optional[Client]:
+    """Получить клиент Pyrogram для пользователя"""
+    if user_id in clients:
+        return clients[user_id]
+    
+    # Попробовать восстановить сессию из БД
+    conn = sqlite3.connect(SESSION_DB)
+    c = conn.cursor()
+    c.execute("SELECT session_string FROM user_sessions WHERE user_id = ?", (user_id,))
+    result = c.fetchone()
+    conn.close()
+    
+    if result:
+        session_string = result[0]
+        # Восстановить клиента из строки сессии
+        # Здесь нужна реализация восстановления сессии
+        pass
+    
+    return None
+
+async def create_client(api_id: int, api_hash: str, phone: str = None) -> Client:
+    """Создать клиент Pyrogram"""
+    session_name = f"session_{hashlib.md5(phone.encode()).hexdigest()}" if phone else "temp_session"
+    
+    client = Client(
+        name=session_name,
+        api_id=api_id,
+        api_hash=api_hash,
+        workdir=str(BASE_DIR / "sessions")
+    )
+    
+    return client
+
+def save_session_to_db(user_id: int, session_string: str, phone: str):
+    """Сохранить сессию в БД"""
+    conn = sqlite3.connect(SESSION_DB)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO user_sessions (user_id, session_string, phone_number) VALUES (?, ?, ?)",
+        (user_id, session_string, phone)
+    )
+    conn.commit()
+    conn.close()
+
+def save_api_credentials(api_id: int, api_hash: str):
+    """Сохранить API credentials в БД"""
+    conn = sqlite3.connect(SESSION_DB)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO api_credentials (api_id, api_hash) VALUES (?, ?)",
+        (api_id, api_hash)
+    )
+    conn.commit()
+    conn.close()
+
+def get_api_credentials() -> Tuple[int, str]:
+    """Получить последние API credentials из БД"""
+    conn = sqlite3.connect(SESSION_DB)
+    c = conn.cursor()
+    c.execute("SELECT api_id, api_hash FROM api_credentials ORDER BY id DESC LIMIT 1")
+    result = c.fetchone()
+    conn.close()
+    
+    if result:
+        return result[0], result[1]
+    return None, None
+
+# МАРШРУТЫ FLASK =============================================================
+
+@app.route('/')
+def index():
+    """Главная страница"""
+    if 'user_id' in session:
+        # Пользователь авторизован - показать главный интерфейс
+        api_id, api_hash = get_api_credentials()
+        if not api_id or not api_hash:
+            return redirect(url_for('api_login'))
+        
+        # Получить информацию о пользователе
+        client = get_client(session['user_id'])
+        if client:
+            return render_template_string(MAIN_HTML, user=client.get_me())
+        
+        return render_template_string(MAIN_HTML, user={'first_name': 'Пользователь'})
+    
+    # Проверить, есть ли сохраненные API credentials
+    api_id, api_hash = get_api_credentials()
+    if api_id and api_hash:
+        return redirect(url_for('phone'))
+    
+    return render_template_string(LOGIN_HTML)
+
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    """Обработка ввода API credentials"""
+    api_id = request.form.get('api_id')
+    api_hash = request.form.get('api_hash')
+    
+    if not api_id or not api_hash:
+        return render_template_string(LOGIN_HTML, error="Пожалуйста, заполните все поля")
+    
+    try:
+        api_id = int(api_id)
+        save_api_credentials(api_id, api_hash)
+        session['api_id'] = api_id
+        session['api_hash'] = api_hash
+        return redirect(url_for('phone'))
+    except ValueError:
+        return render_template_string(LOGIN_HTML, error="API ID должен быть числом")
+
+@app.route('/phone')
+def phone():
+    """Страница ввода номера телефона"""
+    if 'api_id' not in session or 'api_hash' not in session:
+        return redirect(url_for('index'))
+    return render_template_string(PHONE_HTML)
+
+@app.route('/send_code', methods=['POST'])
+def send_code():
+    """Отправка кода подтверждения"""
+    phone_number = request.form.get('phone')
+    
+    if not phone_number:
+        return render_template_string(PHONE_HTML, error="Введите номер телефона")
+    
+    try:
+        # Сохранить номер в сессии
+        session['phone'] = phone_number
+        
+        # Создать клиент и отправить код
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        client = loop.run_until_complete(create_client(
+            session['api_id'],
+            session['api_hash'],
+            phone_number
+        ))
+        
+        async def send_code_async():
+            await client.connect()
+            sent_code = await client.send_code(phone_number)
+            return sent_code.phone_code_hash
+        
+        phone_code_hash = loop.run_until_complete(send_code_async())
+        loop.run_until_complete(client.disconnect())
+        
+        # Сохранить hash кода в сессии
+        session['phone_code_hash'] = phone_code_hash
+        
+        return redirect(url_for('code'))
+    except Exception as e:
+        return render_template_string(PHONE_HTML, error=f"Ошибка: {str(e)}")
+
+@app.route('/code')
+def code():
+    """Страница ввода кода"""
+    if 'phone' not in session or 'phone_code_hash' not in session:
+        return redirect(url_for('phone'))
+    return render_template_string(CODE_HTML, phone=session['phone'])
+
+@app.route('/verify_code', methods=['POST'])
+def verify_code():
+    """Проверка кода подтверждения"""
+    code = request.form.get('code')
+    
+    if not code or len(code) != 5:
+        return render_template_string(CODE_HTML, phone=session['phone'], error="Введите 5-значный код")
+    
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        client = loop.run_until_complete(create_client(
+            session['api_id'],
+            session['api_hash'],
+            session['phone']
+        ))
+        
+        async def sign_in_async():
+            await client.connect()
+            
+            try:
+                signed_in = await client.sign_in(
+                    phone_number=session['phone'],
+                    phone_code_hash=session['phone_code_hash'],
+                    phone_code=code
+                )
+                
+                # Сохранить клиента
+                user_id = signed_in.id
+                clients[user_id] = client
+                
+                # Сохранить сессию в БД
+                session_string = await client.export_session_string()
+                save_session_to_db(user_id, session_string, session['phone'])
+                
+                # Сохранить user_id в сессии Flask
+                session['user_id'] = user_id
+                
+                # Очистить временные данные
+                session.pop('phone_code_hash', None)
+                
+                await client.disconnect()
+                return True, None
+                
+            except SessionPasswordNeeded:
+                # Нужен пароль 2FA
+                session['needs_password'] = True
+                await client.disconnect()
+                return False, 'password'
+            except PhoneCodeInvalid:
+                return False, 'Неверный код'
+            except PhoneCodeExpired:
+                return False, 'Код устарел'
+        
+        success, result = loop.run_until_complete(sign_in_async())
+        
+        if success:
+            return redirect(url_for('index'))
+        elif result == 'password':
+            return redirect(url_for('password'))
+        else:
+            return render_template_string(CODE_HTML, phone=session['phone'], error=result)
+            
+    except FloodWait as e:
+        wait_time = e.value
+        return render_template_string(CODE_HTML, phone=session['phone'], 
+                                   error=f"Слишком много попыток. Подождите {wait_time} секунд")
+    except Exception as e:
+        return render_template_string(CODE_HTML, phone=session['phone'], error=f"Ошибка: {str(e)}")
+
+@app.route('/resend_code', methods=['POST'])
+def resend_code():
+    """Повторная отправка кода"""
+    data = request.get_json()
+    phone = data.get('phone')
+    
+    if not phone:
+        return jsonify({'success': False, 'error': 'Нет номера телефона'})
+    
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        client = loop.run_until_complete(create_client(
+            session['api_id'],
+            session['api_hash'],
+            phone
+        ))
+        
+        async def resend_code_async():
+            await client.connect()
+            sent_code = await client.send_code(phone)
+            return sent_code.phone_code_hash
+        
+        phone_code_hash = loop.run_until_complete(resend_code_async())
+        loop.run_until_complete(client.disconnect())
+        
+        # Обновить hash кода в сессии
+        session['phone_code_hash'] = phone_code_hash
+        
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/password')
+def password():
+    """Страница ввода пароля 2FA"""
+    if 'needs_password' not in session:
+        return redirect(url_for('code'))
+    return render_template_string(PASSWORD_HTML)
+
+@app.route('/check_password', methods=['POST'])
+def check_password():
+    """Проверка пароля 2FA"""
+    password = request.form.get('password')
+    
+    if not password:
+        return render_template_string(PASSWORD_HTML, error="Введите пароль")
+    
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        client = loop.run_until_complete(create_client(
+            session['api_id'],
+            session['api_hash'],
+            session['phone']
+        ))
+        
+        async def check_password_async():
+            await client.connect()
+            
+            try:
+                signed_in = await client.check_password(password)
+                
+                # Сохранить клиента
+                user_id = signed_in.id
+                clients[user_id] = client
+                
+                # Сохранить сессию в БД
+                session_string = await client.export_session_string()
+                save_session_to_db(user_id, session_string, session['phone'])
+                
+                # Сохранить user_id в сессии Flask
+                session['user_id'] = user_id
+                
+                # Очистить временные данные
+                session.pop('needs_password', None)
+                session.pop('phone_code_hash', None)
+                
+                await client.disconnect()
+                return True
+            except Exception as e:
+                return False, str(e)
+        
+        success, error = loop.run_until_complete(check_password_async())
+        
+        if success:
+            return redirect(url_for('index'))
+        else:
+            return render_template_string(PASSWORD_HTML, error=f"Неверный пароль: {error}")
+            
+    except Exception as e:
+        return render_template_string(PASSWORD_HTML, error=f"Ошибка: {str(e)}")
+
+@app.route('/logout')
+def logout():
+    """Выход из системы"""
+    # Отключить клиент Pyrogram
+    user_id = session.get('user_id')
+    if user_id and user_id in clients:
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(clients[user_id].disconnect())
+        except:
+            pass
+        clients.pop(user_id, None)
+    
+    # Очистить сессию Flask
+    session.clear()
+    return redirect(url_for('index'))
+
+# API МАРШРУТЫ ===============================================================
+
+@app.route('/api/chats')
+def api_chats():
+    """API для получения списка чатов"""
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Не авторизован'})
+    
+    try:
+        offset = int(request.args.get('offset', 0))
+        limit = int(request.args.get('limit', 20))
+        
+        client = get_client(session['user_id'])
+        if not client:
+            return jsonify({'success': False, 'error': 'Клиент не найден'})
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        async def get_chats_async():
+            await client.connect()
+            dialogs = await client.get_dialogs(limit=limit, offset=offset)
+            await client.disconnect()
+            
+            chats = []
+            for dialog in dialogs:
+                chat = {
+                    'id': dialog.chat.id,
+                    'title': get_chat_title(dialog.chat),
+                    'type': str(dialog.chat.type),
+                    'last_message': dialog.top_message.text[:50] if dialog.top_message and hasattr(dialog.top_message, 'text') else '',
+                    'last_message_date': dialog.top_message.date.timestamp() if dialog.top_message else None,
+                    'unread_count': dialog.unread_messages_count,
+                    'is_online': getattr(dialog.chat, 'status', None) == enums.UserStatus.RECENTLY,
+                    'photo': None
+                }
+                
+                # Получить фото чата (если есть)
+                if hasattr(dialog.chat, 'photo'):
+                    chat['photo'] = f"chat_{dialog.chat.id}_photo.jpg"
+                
+                chats.append(chat)
+            
+            return chats
+        
+        chats = loop.run_until_complete(get_chats_async())
+        return jsonify({'success': True, 'chats': chats})
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/messages/<int:chat_id>')
+def api_messages(chat_id):
+    """API для получения сообщений чата"""
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Не авторизован'})
+    
+    try:
+        client = get_client(session['user_id'])
+        if not client:
+            return jsonify({'success': False, 'error': 'Клиент не найден'})
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        async def get_messages_async():
+            await client.connect()
+            messages = await client.get_chat_history(chat_id, limit=50)
+            await client.disconnect()
+            
+            formatted_messages = []
+            for message in messages:
+                msg = {
+                    'id': message.id,
+                    'text': message.text or (message.caption or ''),
+                    'date': message.date.timestamp(),
+                    'outgoing': message.outgoing,
+                    'status': 'sent',
+                    'media': None
+                }
+                
+                # Обработка медиа
+                if message.photo:
+                    msg['media'] = f"media_{message.id}.jpg"
+                
+                formatted_messages.append(msg)
+            
+            return formatted_messages
+        
+        messages = loop.run_until_complete(get_messages_async())
+        return jsonify({'success': True, 'messages': messages})
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/send_message', methods=['POST'])
+def api_send_message():
+    """API для отправки сообщения"""
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Не авторизован'})
+    
+    try:
+        data = request.get_json()
+        chat_id = data.get('chat_id')
+        text = data.get('text')
+        
+        if not chat_id or not text:
+            return jsonify({'success': False, 'error': 'Не указан chat_id или текст'})
+        
+        client = get_client(session['user_id'])
+        if not client:
+            return jsonify({'success': False, 'error': 'Клиент не найден'})
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        async def send_message_async():
+            await client.connect()
+            sent_message = await client.send_message(chat_id, text)
+            await client.disconnect()
+            
+            return {
+                'id': sent_message.id,
+                'text': sent_message.text,
+                'date': sent_message.date.timestamp(),
+                'outgoing': True,
+                'status': 'sent'
+            }
+        
+        message = loop.run_until_complete(send_message_async())
+        return jsonify({'success': True, 'message': message})
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/check_messages/<int:chat_id>')
+def api_check_messages(chat_id):
+    """API для проверки новых сообщений"""
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Не авторизован'})
+    
+    # В реальном приложении здесь была бы реализация
+    # получения новых сообщений через long polling или websockets
+    return jsonify({'success': True, 'has_new': False, 'new_messages': []})
+
+@app.route('/api/media/<path:filename>')
+def api_media(filename):
+    """API для получения медиа файлов"""
+    # Заглушка для медиа файлов
+    # В реальном приложении здесь была бы загрузка и кэширование медиа
+    return jsonify({'success': False, 'error': 'Медиа не реализовано'})
+
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===================================================
+
+def get_chat_title(chat):
+    """Получить название чата"""
+    if hasattr(chat, 'title') and chat.title:
+        return chat.title
+    elif hasattr(chat, 'first_name'):
+        name = chat.first_name or ''
+        if hasattr(chat, 'last_name') and chat.last_name:
+            name += f" {chat.last_name}"
+        return name.strip()
+    elif hasattr(chat, 'username') and chat.username:
+        return chat.username
+    return f"Чат {chat.id}"
+
+# ЗАПУСК ПРИЛОЖЕНИЯ ==========================================================
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("Telegram Web Client")
+    print("=" * 60)
+    print(f"Доступен по адресу: http://localhost:5000")
+    print(f"Папка с сессиями: {BASE_DIR / 'sessions'}")
+    print(f"База данных: {SESSION_DB}")
+    print("=" * 60)
+    
+    # Создать папку для сессий если её нет
+    (BASE_DIR / "sessions").mkdir(exist_ok=True)
+    
+    app.run(host='0.0.0.0', port=5000, debug=True)
